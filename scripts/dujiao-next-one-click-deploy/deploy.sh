@@ -26,6 +26,13 @@ else
   ANSI_GREEN=''
 fi
 
+INPUT_FD=0
+if [[ ! -t 0 && -r /dev/tty ]]; then
+  if exec 9</dev/tty; then
+    INPUT_FD=9
+  fi
+fi
+
 print_line() {
   printf '%s\n' "------------------------------------------------------------"
 }
@@ -86,18 +93,42 @@ ensure_command() {
   fi
 }
 
+read_with_prompt() {
+  local prompt="$1"
+  local value=""
+
+  if [[ "${INPUT_FD}" -eq 0 ]]; then
+    if ! IFS= read -r -p "${prompt}" value; then
+      return 1
+    fi
+  else
+    printf '%s' "${prompt}" > /dev/tty
+    if ! IFS= read -r -u "${INPUT_FD}" value; then
+      return 1
+    fi
+  fi
+
+  printf '%s' "${value}"
+}
+
 prompt_with_default() {
   local prompt="$1"
   local default_value="${2:-}"
   local value=""
   if [[ -n "${default_value}" ]]; then
-    read -r -p "${prompt} [${default_value}]: " value
+    if ! value="$(read_with_prompt "${prompt} [${default_value}]: ")"; then
+      error "未读取到输入，请确认当前终端支持交互输入。"
+      return 1
+    fi
     value="$(trim "${value}")"
     if [[ -z "${value}" ]]; then
       value="${default_value}"
     fi
   else
-    read -r -p "${prompt}: " value
+    if ! value="$(read_with_prompt "${prompt}: ")"; then
+      error "未读取到输入，请确认当前终端支持交互输入。"
+      return 1
+    fi
     value="$(trim "${value}")"
   fi
   printf '%s' "${value}"
@@ -112,7 +143,10 @@ ask_yes_no() {
     hint="[y/N]"
   fi
   while true; do
-    read -r -p "${prompt} ${hint}: " answer
+    if ! answer="$(read_with_prompt "${prompt} ${hint}: ")"; then
+      error "未读取到输入，请确认当前终端支持交互输入。"
+      return 1
+    fi
     answer="$(trim "${answer}")"
     if [[ -z "${answer}" ]]; then
       answer="${default_answer}"
@@ -352,6 +386,21 @@ ensure_port_available() {
   fi
 }
 
+ensure_distinct_ports() {
+  local entry label port
+  declare -A used_ports=()
+
+  for entry in "$@"; do
+    label="${entry%%:*}"
+    port="${entry#*:}"
+    if [[ -n "${used_ports[${port}]:-}" ]]; then
+      error "端口 ${port} 同时分配给 ${used_ports[${port}]} 和 ${label}，请重新设置。"
+      return 1
+    fi
+    used_ports["${port}"]="${label}"
+  done
+}
+
 precheck_https_common() {
   local user_domain="$1"
   local admin_domain="$2"
@@ -370,7 +419,10 @@ select_docker_database_mode() {
     echo "1. SQLite + Redis（轻量）"
     echo "2. PostgreSQL + Redis（生产）"
     print_line
-    read -r -p "请输入选项 [1-2]: " choice
+    if ! choice="$(read_with_prompt "请输入选项 [1-2]: ")"; then
+      error "未读取到输入，请确认当前终端支持交互输入。"
+      return 1
+    fi
     choice="$(trim "${choice}")"
     case "${choice}" in
       1)
@@ -500,7 +552,7 @@ services:
     volumes:
       - ./data/redis:/data
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep PONG"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 10s
       timeout: 3s
       retries: 10
@@ -581,7 +633,7 @@ services:
     volumes:
       - ./data/redis:/data
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep PONG"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 10s
       timeout: 3s
       retries: 10
@@ -715,6 +767,26 @@ deploy_with_docker() {
   fi
   admin_username="$(prompt_with_default "请输入默认管理员用户名" "admin")"
   admin_password="$(prompt_with_default "请输入默认管理员密码" "admin123")"
+
+  if [[ "${db_mode}" == "postgres" ]]; then
+    ensure_distinct_ports \
+      "API:${api_port}" \
+      "User:${user_port}" \
+      "Admin:${admin_port}" \
+      "Redis:${redis_port}" \
+      "PostgreSQL:${postgres_port}"
+    ensure_port_available "${postgres_port}"
+  else
+    ensure_distinct_ports \
+      "API:${api_port}" \
+      "User:${user_port}" \
+      "Admin:${admin_port}" \
+      "Redis:${redis_port}"
+  fi
+  ensure_port_available "${api_port}"
+  ensure_port_available "${user_port}"
+  ensure_port_available "${admin_port}"
+  ensure_port_available "${redis_port}"
 
   mkdir -p "${deploy_dir}/config" \
     "${deploy_dir}/data/db" \
@@ -1702,7 +1774,10 @@ show_deploy_menu() {
 handle_deploy_menu() {
   while true; do
     show_deploy_menu
-    read -r -p "请输入选项 [0-2]: " deploy_choice
+    if ! deploy_choice="$(read_with_prompt "请输入选项 [0-2]: ")"; then
+      error "未读取到输入，请确认当前终端支持交互输入。"
+      return 1
+    fi
     deploy_choice="$(trim "${deploy_choice}")"
     case "${deploy_choice}" in
       1)
@@ -1728,7 +1803,10 @@ main() {
   ensure_command curl
   while true; do
     show_main_menu
-    read -r -p "请输入选项 [0-3]: " choice
+    if ! choice="$(read_with_prompt "请输入选项 [0-3]: ")"; then
+      error "未读取到输入，请确认当前终端支持交互输入。"
+      exit 1
+    fi
     choice="$(trim "${choice}")"
     case "${choice}" in
       1)
