@@ -288,7 +288,7 @@ bash dujiao-next-install.sh
 ![Binary Deployment Flow](./assets/screenshots/binary-deploy.png)
 
 ### Daily Operations Menu
-![Daily Operations Menu](./assets/screenshots/ops-menu.png.png)
+![Daily Operations Menu](./assets/screenshots/ops-menu.png)
 
 ### Version Check
 ![Version Check](./assets/screenshots/update-check.png)

@@ -338,7 +338,7 @@ bash dujiao-next-install.sh
 ![二进制部署流程](./assets/screenshots/binary-deploy.png)
 
 ### 日常管理菜单
-![日常管理菜单](./assets/screenshots/ops-menu.png.png)
+![日常管理菜单](./assets/screenshots/ops-menu.png)
 
 ### 版本检查
 ![版本检查](./assets/screenshots/update-check.png)
