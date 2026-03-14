@@ -313,6 +313,13 @@ su - root
 推荐方式：
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/dujiao-next/community-projects/main/scripts/langge-dujiao-next-install/dujiao-next-install.sh -o dujiao-next-install.sh
+bash dujiao-next-install.sh
+```
+
+镜像分发地址：
+
+```bash
 curl -fsSL https://down.dujiao-next.cc/dujiao-next-install.sh -o dujiao-next-install.sh
 bash dujiao-next-install.sh
 ```
