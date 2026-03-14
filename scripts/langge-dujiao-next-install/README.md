@@ -20,6 +20,11 @@ It supports:
 
 This project is published as an independent community script and does not replace the official community deployment script.
 
+## Video Tutorial
+
+- Bilibili walkthrough video
+  https://www.bilibili.com/video/BV1W2wtzkEXr
+
 ## Use Cases
 
 This script is a good fit for:
@@ -40,7 +45,12 @@ Less suitable for:
 - Menu-driven workflow for deploy, update, HTTPS, ops, and hardening
 - Covers `api + user + admin` in one script
 - Supports Docker Compose, binary, and external-environment deployment modes
+- Binary deployment supports:
+  - SQLite + Redis
+  - PostgreSQL + Redis
 - Includes version checks, service operations, backups, cleanup, and uninstall
+- Detects partial Docker installs and can clean residual state before reinstall
+- Adds pre-checks for HTTPS, including local firewall handling and cloud firewall confirmation
 - Uses safer state loading logic and avoids direct `curl | sh` for `acme.sh`
 
 ## Menu Structure
@@ -84,6 +94,8 @@ Capabilities include:
 - Auto-generated `.env`, `config.yml`, and compose files
 - Image pull and service startup
 - API health checks
+- Detection and cleanup for incomplete previous Docker installs
+- Wait for PostgreSQL / Redis to become healthy and restart app containers afterward
 - Optional Nginx reverse proxy and HTTPS setup
 - Local deployment state persistence
 
@@ -93,8 +105,14 @@ Capabilities include:
 
 - Linux architecture detection (`x86_64` / `arm64`)
 - Auto install required tools and Redis / Nginx
+- Database mode selection:
+  - SQLite + Redis
+  - PostgreSQL + Redis
 - Download API / User / Admin release packages
 - Extract and install API binary and frontend assets
+- Auto install local PostgreSQL when `PostgreSQL + Redis` is selected
+- Pre-check local PostgreSQL availability before writing config
+- Auto create / reuse PostgreSQL database and user
 - Generate API config, JWT, Redis, and queue settings
 - Configure default admin account
 - Write and enable a systemd service
@@ -135,13 +153,17 @@ Capabilities include:
 
 Mode-specific HTTPS flow:
 
-- Docker: Caddy auto issuance and renewal
+- Docker: Nginx + `acme.sh`
 - Binary: `acme.sh` + Nginx
 - External: guidance only, handled in panel
 
 Capabilities include:
 
 - Domain resolution checks
+- Automatic opening of local firewall ports `80/443` for UFW / firewalld
+- Manual confirmation step for cloud firewall / security-group rules
+- Automatic `socat` installation for standalone issuance
+- ECC certificate re-issue fallback when old cert metadata exists but installable files are missing
 - Certificate issuance
 - Caddy / Nginx config generation
 - Renewal task setup
@@ -166,6 +188,10 @@ Capabilities include:
 - Restart API / User / Admin / Nginx / all
 - SQLite / PostgreSQL backup
 - Upload directory backup
+- More accurate backup result reporting:
+  - completed
+  - partially completed
+  - failed
 - Docker cleanup
 - Full uninstall with install dir, state file, and Nginx cleanup
 
