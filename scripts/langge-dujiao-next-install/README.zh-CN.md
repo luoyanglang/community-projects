@@ -21,11 +21,6 @@ Language: [English](./README.md) | **简体中文**
 
 这个项目以独立社区脚本的形式发布，不覆盖官方社区仓里已有的一键部署脚本。
 
-## 视频教程
-
-- 哔哩哔哩教程：  
-  https://www.bilibili.com/video/BV1W2wtzkEXr
-
 ## 适用场景
 
 这份脚本更适合下面这些场景：
