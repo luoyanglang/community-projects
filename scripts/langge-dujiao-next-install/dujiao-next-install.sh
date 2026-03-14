@@ -2121,7 +2121,8 @@ install_or_prepare_acme_sh() {
     error "acme.sh 下载失败"
     return 1
   fi
-  if ! grep -q "PROJECT_NAME='acme.sh'" "${tmp_file}"; then
+  if ! grep -Eq '^PROJECT_NAME=["'\'']acme\.sh["'\'']$' "${tmp_file}" || \
+     ! grep -q 'DEFAULT_INSTALL_HOME=' "${tmp_file}"; then
     rm -f "${tmp_file}"
     error "acme.sh 下载内容校验失败"
     return 1
