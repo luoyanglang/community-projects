@@ -263,7 +263,14 @@ su - root
 Recommended:
 
 ```bash
-curl -fsSL https://your-download-domain.example/dujiao-next-install.sh -o dujiao-next-install.sh
+curl -fsSL https://raw.githubusercontent.com/dujiao-next/community-projects/main/scripts/langge-dujiao-next-install/dujiao-next-install.sh -o dujiao-next-install.sh
+bash dujiao-next-install.sh
+```
+
+Mirror download:
+
+```bash
+curl -fsSL https://down.dujiao-next.cc/dujiao-next-install.sh -o dujiao-next-install.sh
 bash dujiao-next-install.sh
 ```
 
