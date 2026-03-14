@@ -21,6 +21,11 @@ Language: [English](./README.md) | **简体中文**
 
 这个项目以独立社区脚本的形式发布，不覆盖官方社区仓里已有的一键部署脚本。
 
+## 视频教程
+
+- 哔哩哔哩教程：  
+  https://www.bilibili.com/video/BV1W2wtzkEXr
+
 ## 适用场景
 
 这份脚本更适合下面这些场景：
@@ -41,7 +46,12 @@ Language: [English](./README.md) | **简体中文**
 - 菜单式交互，适合新手与轻运维场景
 - 覆盖 `api + user + admin` 三端部署、更新、HTTPS、运维与加固
 - 同时支持 Docker Compose、二进制、外部环境三种部署形态
+- 二进制部署支持：
+  - SQLite + Redis
+  - PostgreSQL + Redis
 - 内置版本检测、日常管理、数据库备份、日志查看、服务重启
+- 支持检测半安装残留，并在重装前提示清理
+- 证书申请前支持本机防火墙放行与云安全组确认
 - 对状态文件读取与 `acme.sh` 安装方式做了额外安全收口
 
 ## 菜单结构与完整功能
@@ -93,6 +103,8 @@ Language: [English](./README.md) | **简体中文**
   - `docker-compose.postgres.yml`
 - 自动拉取镜像并启动服务
 - 自动执行 API 健康检查
+- 检测并清理未完成安装残留
+- 等待 PostgreSQL / Redis 健康后自动重启 API / User / Admin 容器
 - 自动安装 Nginx
 - 支持两种站点接入方式：
   - HTTP 反向代理
@@ -112,11 +124,17 @@ Language: [English](./README.md) | **简体中文**
   - `curl`
   - `redis-server`
   - `nginx`
+- 可选择数据库方案：
+  - SQLite + Redis
+  - PostgreSQL + Redis
 - 自动下载 API / User / Admin Release 包
 - 自动解压并安装：
   - API 二进制
   - User 前端静态文件
   - Admin 前端静态文件
+- 选择 `PostgreSQL + Redis` 时自动安装本机 PostgreSQL
+- 写入配置前自动做 PostgreSQL 可用性预检查
+- 自动创建或复用 PostgreSQL 数据库与用户
 - 自动生成 API 配置文件
 - 自动生成 JWT / User JWT / Redis 队列配置
 - 自动设置默认管理员账户
@@ -162,13 +180,17 @@ Language: [English](./README.md) | **简体中文**
 
 根据部署模式选择不同的 HTTPS 方案：
 
-- Docker 模式：Caddy 自动签发与续期
+- Docker 模式：Nginx + `acme.sh`
 - 二进制模式：`acme.sh` + Nginx
 - 外部环境模式：提示在面板中自行配置证书
 
 三级能力包括：
 
 - 域名解析预检查
+- 自动放行本机 UFW / firewalld 的 `80/443`
+- 申请证书前提示确认云安全组 / 服务商防火墙已放行 `80/443`
+- 自动安装 `socat`
+- 检测到旧证书记录但缺失可安装的 ECC 文件时，自动尝试重新签发
 - 证书申请
 - Nginx/Caddy 配置写入
 - 自动续期任务配置
@@ -203,6 +225,10 @@ Language: [English](./README.md) | **简体中文**
   - SQLite 备份
   - PostgreSQL 备份
   - 上传目录备份
+- 更准确的备份结果提示：
+  - 备份完成
+  - 备份部分完成
+  - 备份失败
 - 清理 Docker：
   - 停止容器
   - 无用镜像

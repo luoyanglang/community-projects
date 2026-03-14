@@ -286,6 +286,98 @@ fetch_latest_release_tag() {
   printf '%s' "${tag}"
 }
 
+docker_install_residue_detected() {
+  local deploy_dir="$1"
+  [[ -f "${deploy_dir}/.env" ]] && return 0
+  [[ -f "${deploy_dir}/config/config.yml" ]] && return 0
+  [[ -f "${deploy_dir}/docker-compose.postgres.yml" ]] && return 0
+  [[ -f "${deploy_dir}/docker-compose.sqlite.yml" ]] && return 0
+  [[ -d "${deploy_dir}/data/postgres" ]] && return 0
+  [[ -d "${deploy_dir}/data/db" ]] && return 0
+  [[ -d "${deploy_dir}/data/redis" ]] && return 0
+
+  local name
+  for name in dujiaonext-api dujiaonext-user dujiaonext-admin dujiaonext-redis dujiaonext-postgres; do
+    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -Fxq "${name}"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+cleanup_partial_docker_install() {
+  local deploy_dir="$1" compose_path project_name name
+  info "清理旧的 Docker 安装残留..."
+
+  for compose_path in "${deploy_dir}/docker-compose.postgres.yml" "${deploy_dir}/docker-compose.sqlite.yml"; do
+    if [[ -f "${compose_path}" ]]; then
+      if [[ -f "${deploy_dir}/.env" ]]; then
+        docker compose --env-file "${deploy_dir}/.env" -f "${compose_path}" down -v --remove-orphans >/dev/null 2>&1 || true
+      else
+        docker compose -f "${compose_path}" down -v --remove-orphans >/dev/null 2>&1 || true
+      fi
+    fi
+  done
+
+  for name in dujiaonext-api dujiaonext-user dujiaonext-admin dujiaonext-redis dujiaonext-postgres; do
+    docker rm -f "${name}" >/dev/null 2>&1 || true
+  done
+
+  project_name="$(basename "${deploy_dir}")"
+  docker network rm "${project_name}_dujiao-net" >/dev/null 2>&1 || true
+
+  rm -f "${deploy_dir}/.env" \
+    "${deploy_dir}/docker-compose.postgres.yml" \
+    "${deploy_dir}/docker-compose.sqlite.yml" \
+    "${deploy_dir}/config/config.yml"
+  rm -rf "${deploy_dir}/data/postgres" \
+    "${deploy_dir}/data/db" \
+    "${deploy_dir}/data/redis"
+}
+
+wait_for_docker_service_ready() {
+  local env_file="$1" compose_file="$2" service="$3"
+  local cid="" status="" retry=0
+
+  while true; do
+    cid="$(docker compose --env-file "${env_file}" -f "${compose_file}" ps -q "${service}" 2>/dev/null | head -n1)"
+    [[ -n "${cid}" ]] || { sleep 2; retry=$((retry+1)); [[ ${retry} -gt 40 ]] && return 1; continue; }
+    status="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${cid}" 2>/dev/null || true)"
+    case "${status}" in
+      healthy|running) return 0 ;;
+      exited|dead) return 1 ;;
+    esac
+    retry=$((retry+1))
+    [[ ${retry} -gt 40 ]] && return 1
+    sleep 3
+  done
+}
+
+wait_for_docker_dependencies() {
+  local env_file="$1" compose_file="$2" db_mode="$3"
+  info "等待依赖服务就绪..."
+  wait_for_docker_service_ready "${env_file}" "${compose_file}" "redis" || {
+    error "Redis 服务未就绪"
+    return 1
+  }
+  if [[ "${db_mode}" == "postgres" ]]; then
+    wait_for_docker_service_ready "${env_file}" "${compose_file}" "postgres" || {
+      error "PostgreSQL 服务未就绪"
+      return 1
+    }
+  fi
+}
+
+restart_docker_app_services() {
+  local env_file="$1" compose_file="$2"
+  info "重启应用容器以刷新与 Redis/数据库 的连接状态..."
+  docker compose --env-file "${env_file}" -f "${compose_file}" restart api user admin >/dev/null 2>&1 || {
+    warn "应用容器重启失败，请稍后手动执行 docker compose restart api user admin"
+    return 1
+  }
+  sleep 3
+}
+
 # ══════════════════════════════════════════════════
 # 状态管理
 # ══════════════════════════════════════════════════
@@ -421,6 +513,17 @@ get_saved_api_port() {
   fi
 
   printf '8080'
+}
+
+get_saved_env_value() {
+  local key="$1" default_value="${2:-}"
+  local install_dir="${INSTALL_DIR:-}"
+  if [[ -n "${install_dir}" && -f "${install_dir}/.env" ]]; then
+    local value
+    value="$(grep "^${key}=" "${install_dir}/.env" 2>/dev/null | cut -d= -f2- | head -n1 || true)"
+    [[ -n "${value}" ]] && { printf '%s' "${value}"; return 0; }
+  fi
+  printf '%s' "${default_value}"
 }
 
 # ══════════════════════════════════════════════════
@@ -886,6 +989,62 @@ auto_install_nginx() {
   success "Nginx 安装完成"
 }
 
+auto_install_socat() {
+  if command_exists socat; then
+    info "socat 已安装: $(socat -V 2>/dev/null | head -n 1)"
+    return 0
+  fi
+  info "安装 socat..."
+  if command_exists apt-get; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq socat
+  elif command_exists yum; then
+    yum install -y -q socat
+  else
+    error "不支持的包管理器，请手动安装 socat"; print_fail_author; return 1
+  fi
+  command_exists socat || { error "socat 安装失败"; print_fail_author; return 1; }
+  success "socat 安装完成"
+}
+
+ensure_https_firewall_ports() {
+  local changed=false
+  if command_exists ufw; then
+    local ufw_status
+    ufw_status="$(ufw status 2>/dev/null | head -n1 || true)"
+    if [[ "${ufw_status}" == "Status: active" ]]; then
+      info "检测到 UFW 已启用，自动放行 80/443..."
+      run_as_root ufw allow 80/tcp >/dev/null 2>&1 || true
+      run_as_root ufw allow 443/tcp >/dev/null 2>&1 || true
+      changed=true
+    fi
+  fi
+
+  if command_exists firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+    info "检测到 firewalld 已启用，自动放行 http/https..."
+    run_as_root firewall-cmd --permanent --add-service=http >/dev/null 2>&1 || true
+    run_as_root firewall-cmd --permanent --add-service=https >/dev/null 2>&1 || true
+    run_as_root firewall-cmd --reload >/dev/null 2>&1 || true
+    changed=true
+  fi
+
+  if [[ "${changed}" == "true" ]]; then
+    success "本机防火墙已处理 80/443 端口放行"
+  else
+    info "未检测到已启用的 UFW / firewalld，跳过本机防火墙自动放行"
+  fi
+}
+
+confirm_cloud_firewall_ports() {
+  local answer=""
+  echo "" >&2
+  warn "请确认云安全组/服务商防火墙已放行 TCP 80 和 443"
+  warn "本机防火墙已自动处理，但云安全组需你在控制台手动确认"
+  printf '确认完成后输入 1 继续申请证书，输入其他任意内容取消: ' >&2
+  read -r answer
+  answer="$(trim "${answer}")"
+  [[ "${answer}" == "1" ]]
+}
+
 write_nginx_binary_site() {
   local conf_file="$1" server_name="$2" dist_dir="$3"
   local api_port="$4" ssl="$5" cert_dir="$6"
@@ -1175,6 +1334,12 @@ setup_ssl_with_nginx() {
   local cert_base="${deploy_dir}/certs"
   local acme_bin="${HOME}/.acme.sh/acme.sh"
 
+  ensure_https_firewall_ports
+  confirm_cloud_firewall_ports || {
+    error "已取消证书申请，请先放行云安全组 80/443 后再重试"
+    return 1
+  }
+  auto_install_socat || return 1
   info "临时停止 Nginx 以使用 standalone 模式申请证书..."
   systemctl stop nginx 2>/dev/null || service nginx stop 2>/dev/null || true
   sleep 1
@@ -1198,6 +1363,21 @@ setup_ssl_with_nginx() {
         failed=true; break
       fi
       warn "证书已存在，继续安装: ${domain}"
+    fi
+    if ! acme_ecc_cert_ready "${domain}"; then
+      warn "未检测到可安装的 ECC 证书，尝试重新签发: ${domain}"
+      _issue_out="$("${acme_bin}" --issue --server letsencrypt \
+        -d "${domain}" --standalone --keylength ec-256 --force \
+        --accountemail "${acme_email}" 2>&1)" || true
+      if ! echo "${_issue_out}" | grep -qE "Cert success|Your cert is in"; then
+        error "域名 ${domain} ECC 证书重新签发失败"
+        echo "${_issue_out}" >&2
+        failed=true; break
+      fi
+    fi
+    if ! acme_ecc_cert_ready "${domain}"; then
+      error "域名 ${domain} 的 ECC 证书文件不存在，无法安装"
+      failed=true; break
     fi
     "${acme_bin}" --install-cert -d "${domain}" --ecc \
       --key-file       "${cert_base}/${domain}/privkey.pem" \
@@ -1322,6 +1502,16 @@ deploy_with_docker() {
   local admin_username admin_password
 
   deploy_dir="$(prompt_with_default "Install directory" "${HOME}/dujiao-next")"
+  if docker_install_residue_detected "${deploy_dir}"; then
+    warn "检测到 ${deploy_dir} 存在未完成安装残留。直接重新全新安装可能导致 Redis/数据库认证异常。"
+    if ask_yes_no "是否先清理旧容器和数据库/缓存数据后再继续全新安装" "y"; then
+      cleanup_partial_docker_install "${deploy_dir}"
+      success "旧安装残留已清理"
+    else
+      error "已取消安装。请先执行卸载，或选择清理残留后继续。"
+      print_fail_author; return 1
+    fi
+  fi
   tz="$(prompt_with_default "时区" "Asia/Shanghai")"
   api_port="$(prompt_with_default "API 端口" "8080")"
   user_port="$(prompt_with_default "User 端口" "8081")"
@@ -1401,6 +1591,13 @@ deploy_with_docker() {
     print_fail_author; return 1
   }
 
+  wait_for_docker_dependencies "${env_file}" "${compose_file}" "${db_mode}" || {
+    error "依赖服务未能成功启动"
+    docker compose --env-file "${env_file}" -f "${compose_file}" logs --tail 50 || true
+    print_fail_author; return 1
+  }
+  restart_docker_app_services "${env_file}" "${compose_file}" || true
+
   info "等待 API 就绪..."
   local health_retry=0
   while ! curl -sf "http://127.0.0.1:${api_port}/health" >/dev/null 2>&1; do
@@ -1452,7 +1649,9 @@ deploy_with_docker() {
   local db_label="SQLite + Redis"
   [[ "${db_mode}" == "postgres" ]] && db_label="PostgreSQL + Redis"
   local proto="http"
+  local api_health_url="http://127.0.0.1:${api_port}/health"
   [[ "${ssl_enabled}" == "true" ]] && proto="https"
+  [[ -n "${api_domain}" ]] && api_health_url="${proto}://${api_domain}/health"
 
   echo ""
   print_line
@@ -1467,7 +1666,7 @@ deploy_with_docker() {
     echo "  Admin : ${proto}://${admin_domain}"
     echo "  API   : ${proto}://${api_domain}"
   fi
-  echo "  API 健康检查 : http://127.0.0.1:${api_port}/health"
+  echo "  API 健康检查 : ${api_health_url}"
   echo ""
   echo "  ${Y}⚠️  请立即登录管理端修改默认密码！${NC}"
   [[ "${ssl_enabled}" == "true" ]] && echo "  ${G}✅ SSL 证书已申请，自动续期每天凌晨3点执行${NC}"
@@ -1518,8 +1717,16 @@ extract_frontend_package() {
 write_binary_config_file() {
   local config_file="$1" install_dir="$2" api_port="$3"
   local admin_user="$4" admin_pass="$5" redis_pass="$6"
+  local db_mode="${7:-sqlite}" pg_host="${8:-127.0.0.1}" pg_port="${9:-5432}"
+  local pg_db="${10:-dujiao_next}" pg_user="${11:-dujiao}" pg_password="${12:-}"
   local jwt; jwt="$(random_string 40)"
   local ujwt; ujwt="$(random_string 40)"
+  local dsn
+  if [[ "${db_mode}" == "postgres" ]]; then
+    dsn="host=${pg_host} port=${pg_port} user=${pg_user} password=${pg_password} dbname=${pg_db} sslmode=disable TimeZone=Asia/Shanghai"
+  else
+    dsn="${install_dir}/db/dujiao.db"
+  fi
   cat > "${config_file}" << CFGEOF
 server:
   host: 0.0.0.0
@@ -1530,8 +1737,8 @@ log:
   dir: "${install_dir}/logs"
 
 database:
-  driver: sqlite
-  dsn: "${install_dir}/db/dujiao.db"
+  driver: ${db_mode}
+  dsn: "${dsn}"
 
 jwt:
   secret: ${jwt}
@@ -1568,6 +1775,124 @@ queue:
 email:
   enabled: false
 CFGEOF
+}
+
+validate_pg_identifier() {
+  [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]
+}
+
+escape_sql_literal() {
+  printf '%s' "${1//\'/\'\'}"
+}
+
+run_psql_as_postgres() {
+  local sql="$1"
+  if command_exists runuser; then
+    runuser -u postgres -- psql -d postgres -Atqc "${sql}"
+  elif command_exists sudo; then
+    sudo -u postgres psql -d postgres -Atqc "${sql}"
+  else
+    su - postgres -s /bin/sh -c "psql -d postgres -Atqc $(printf '%q' "${sql}")"
+  fi
+}
+
+auto_install_local_postgres() {
+  if command_exists psql && command_exists pg_isready; then
+    info "PostgreSQL 已安装"
+  else
+    info "安装 PostgreSQL..."
+    if command_exists apt-get; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql postgresql-client
+    elif command_exists dnf; then
+      dnf install -y -q postgresql-server postgresql
+    elif command_exists yum; then
+      yum install -y -q postgresql-server postgresql
+    else
+      error "不支持的包管理器，请手动安装 PostgreSQL"; print_fail_author; return 1
+    fi
+  fi
+
+  if command_exists postgresql-setup; then
+    postgresql-setup --initdb >/dev/null 2>&1 || postgresql-setup initdb >/dev/null 2>&1 || true
+  fi
+
+  systemctl enable postgresql 2>/dev/null || true
+  systemctl start postgresql 2>/dev/null || true
+  sleep 1
+  command_exists psql && command_exists pg_isready || {
+    error "PostgreSQL 安装失败，请手动检查"; print_fail_author; return 1
+  }
+  success "PostgreSQL 已就绪"
+}
+
+prepare_local_postgres_database() {
+  local pg_port="$1" pg_db="$2" pg_user="$3" pg_password="$4"
+
+  validate_port_number "${pg_port}" || {
+    error "无效的 PostgreSQL 端口: ${pg_port}"
+    return 1
+  }
+  validate_pg_identifier "${pg_db}" || {
+    error "数据库名仅支持字母、数字和下划线，且不能以数字开头"
+    return 1
+  }
+  validate_pg_identifier "${pg_user}" || {
+    error "数据库用户名仅支持字母、数字和下划线，且不能以数字开头"
+    return 1
+  }
+
+  if [[ "${pg_port}" != "5432" ]]; then
+    warn "自动安装 PostgreSQL 默认监听 5432，脚本不会自动修改服务监听端口"
+    if ! ask_yes_no "请确认本机 PostgreSQL 已监听 ${pg_port}，继续配置" "n"; then
+      return 1
+    fi
+  fi
+
+  if ! pg_isready -h 127.0.0.1 -p "${pg_port}" -q >/dev/null 2>&1; then
+    error "本机 PostgreSQL 未在 127.0.0.1:${pg_port} 就绪"
+    return 1
+  fi
+
+  local escaped_password
+  escaped_password="$(escape_sql_literal "${pg_password}")"
+
+  if [[ "$(run_psql_as_postgres "SELECT 1 FROM pg_roles WHERE rolname='${pg_user}';" 2>/dev/null)" == "1" ]]; then
+    warn "检测到数据库用户 ${pg_user} 已存在，将更新其密码"
+    run_psql_as_postgres "ALTER USER \"${pg_user}\" WITH PASSWORD '${escaped_password}';" >/dev/null || {
+      error "更新 PostgreSQL 用户密码失败"
+      return 1
+    }
+  else
+    run_psql_as_postgres "CREATE USER \"${pg_user}\" WITH PASSWORD '${escaped_password}';" >/dev/null || {
+      error "创建 PostgreSQL 用户失败"
+      return 1
+    }
+  fi
+
+  if [[ "$(run_psql_as_postgres "SELECT 1 FROM pg_database WHERE datname='${pg_db}';" 2>/dev/null)" == "1" ]]; then
+    warn "检测到数据库 ${pg_db} 已存在，将复用该数据库并校正属主"
+    run_psql_as_postgres "ALTER DATABASE \"${pg_db}\" OWNER TO \"${pg_user}\";" >/dev/null || {
+      error "更新 PostgreSQL 数据库属主失败"
+      return 1
+    }
+  else
+    run_psql_as_postgres "CREATE DATABASE \"${pg_db}\" OWNER \"${pg_user}\";" >/dev/null || {
+      error "创建 PostgreSQL 数据库失败"
+      return 1
+    }
+  fi
+
+  run_psql_as_postgres "GRANT ALL PRIVILEGES ON DATABASE \"${pg_db}\" TO \"${pg_user}\";" >/dev/null || {
+    error "授予 PostgreSQL 数据库权限失败"
+    return 1
+  }
+
+  if ! PGPASSWORD="${pg_password}" psql -h 127.0.0.1 -p "${pg_port}" -U "${pg_user}" -d "${pg_db}" -c '\q' >/dev/null 2>&1; then
+    error "PostgreSQL 连接预检查失败，请确认用户/密码/端口配置"
+    return 1
+  fi
+
+  success "PostgreSQL 数据库与用户已准备完成"
 }
 
 setup_systemd_service() {
@@ -1640,13 +1965,16 @@ deploy_with_binary() {
     print_fail_author; return 1
   fi
 
+  local install_dir tz api_port user_port admin_port admin_username admin_password
+  local db_mode pg_host pg_port pg_db pg_user pg_password
+  _DB_MODE=""
+  select_docker_database_mode
+  db_mode="${_DB_MODE}"
   local arch; arch="$(detect_binary_arch)"
   local latest_tag; latest_tag="$(fetch_latest_release_tag "${DUJIAO_API_REPO}")"
   local default_tag="${latest_tag:-v0.0.1-beta}"
   local tag; tag="$(prompt_with_default "请输入版本 TAG" "${default_tag}")"
   [[ -z "${tag}" || "${tag}" == "latest" ]] && tag="${default_tag}"
-
-  local install_dir tz api_port user_port admin_port admin_username admin_password
   install_dir="$(prompt_with_default "部署目录" "${HOME}/dujiao-next-bin")"
   tz="$(prompt_with_default "时区" "Asia/Shanghai")"
   api_port="$(prompt_with_default "API 端口" "8080")"
@@ -1654,12 +1982,26 @@ deploy_with_binary() {
   admin_port="$(prompt_with_default "Admin 端口" "8082")"
   admin_username="$(prompt_with_default "管理员用户名" "admin")"
   admin_password="$(prompt_with_default "管理员密码" "Admin@123456")"
+  if [[ "${db_mode}" == "postgres" ]]; then
+    auto_install_local_postgres || return 1
+    pg_host="127.0.0.1"
+    pg_port="$(prompt_with_default "PostgreSQL 端口" "5432")"
+    pg_db="$(prompt_with_default "数据库名" "dujiao_next")"
+    pg_user="$(prompt_with_default "数据库用户名" "dujiao")"
+    pg_password="$(prompt_with_default "数据库密码" "$(random_string 16)")"
+    prepare_local_postgres_database "${pg_port}" "${pg_db}" "${pg_user}" "${pg_password}" || {
+      print_fail_author; return 1
+    }
+  else
+    pg_host=""; pg_port=""; pg_db=""; pg_user=""; pg_password=""
+  fi
 
   mkdir -p "${install_dir}/packages" "${install_dir}/api" \
     "${install_dir}/user/dist" "${install_dir}/admin/dist" \
-    "${install_dir}/db" "${install_dir}/uploads" \
+    "${install_dir}/uploads" \
     "${install_dir}/logs" "${install_dir}/acme-webroot" \
     "${install_dir}/certs"
+  [[ "${db_mode}" == "sqlite" ]] && mkdir -p "${install_dir}/db"
 
   # 确保 Nginx（www-data）能进入安装目录路径中的每一级
   # 逐级对父目录添加 o+x（进入权限），不影响文件读写安全性
@@ -1685,7 +2027,9 @@ deploy_with_binary() {
   chmod -R o+rX "${install_dir}/user/dist"
   chmod -R o+rX "${install_dir}/admin/dist"
 
-  write_binary_config_file "${install_dir}/config.yml" "${install_dir}" "${api_port}" "${admin_username}" "${admin_password}" ""
+  write_binary_config_file "${install_dir}/config.yml" "${install_dir}" "${api_port}" \
+    "${admin_username}" "${admin_password}" "" \
+    "${db_mode}" "${pg_host}" "${pg_port}" "${pg_db}" "${pg_user}" "${pg_password}"
 
   if ask_yes_no "是否创建并启动 systemd 服务" "y"; then
     if setup_systemd_service "${install_dir}" "dujiao-next-api.service" "${tz}" "${admin_username}" "${admin_password}"; then
@@ -1728,21 +2072,24 @@ deploy_with_binary() {
     fi
   fi
 
-  save_deploy_state "binary" "${install_dir}" "${tag}" "${tag}" "${tag}" "sqlite"
   local https_mode="binary-nginx-http"
   local cert_provider="none"
   local proto="http"
+  local api_health_url="http://127.0.0.1:${api_port}/health"
+  local db_label="SQLite"
+  [[ "${db_mode}" == "postgres" ]] && db_label="PostgreSQL"
   if [[ -n "${user_domain}" ]]; then
     if [[ "${ssl_enabled}" == "true" ]]; then
       https_mode="binary-nginx-ssl"; cert_provider="acme-http01"; proto="https"
     fi
-    write_state_file "binary" "${install_dir}" "${tag}" "${tag}" "${tag}" \
-      "sqlite" "$(date '+%Y-%m-%d %H:%M:%S')" \
-      "${ssl_enabled}" "${https_mode}" \
-      "${user_domain}" "${admin_domain}" \
-      "${cert_provider}" "$(date '+%Y-%m-%d %H:%M:%S')" \
-      "${api_port}" "" "" "" "" "${api_domain:-}"
+    [[ -n "${api_domain}" ]] && api_health_url="${proto}://${api_domain}/health"
   fi
+  write_state_file "binary" "${install_dir}" "${tag}" "${tag}" "${tag}" \
+    "${db_mode}" "$(date '+%Y-%m-%d %H:%M:%S')" \
+    "${ssl_enabled:-false}" "${https_mode}" \
+    "${user_domain}" "${admin_domain}" \
+    "${cert_provider}" "$(date '+%Y-%m-%d %H:%M:%S')" \
+    "${api_port}" "${pg_host}" "${pg_port}" "${pg_db}" "${pg_user}" "${api_domain:-}"
 
   echo ""
   print_line
@@ -1750,6 +2097,7 @@ deploy_with_binary() {
   print_line
   echo "  部署目录  : ${install_dir}"
   echo "  架构      : Linux ${arch}"
+  echo "  数据库    : ${db_label}"
   echo "  管理员    : ${admin_username} / ${admin_password}"
   echo ""
   if [[ -n "${user_domain}" ]]; then
@@ -1757,7 +2105,7 @@ deploy_with_binary() {
     echo "  Admin : ${proto}://${admin_domain}"
     echo "  API   : ${proto}://${api_domain}"
   fi
-  echo "  API 健康检查 : http://127.0.0.1:${api_port}/health"
+  echo "  API 健康检查 : ${api_health_url}"
   echo ""
   echo "  ${Y}⚠️  请立即登录管理端修改默认密码！${NC}"
   [[ "${ssl_enabled}" == "true" ]] && echo "  ${G}✅ SSL 证书已申请，自动续期每天凌晨3点执行${NC}"
@@ -2078,33 +2426,40 @@ enable_https_for_docker() {
   local base_compose; base_compose="$(docker_compose_file_from_db_mode "${install_dir}" "${db_mode}")"
   [[ ! -f "${env_file}" || ! -f "${base_compose}" ]] && { error "未找到 Docker 部署文件"; return 1; }
 
-  local user_domain admin_domain acme_email
+  local user_domain admin_domain api_domain acme_email
+  local user_port admin_port api_port
   user_domain="$(prompt_with_default "User 域名" "${USER_DOMAIN:-user.example.com}")"
   admin_domain="$(prompt_with_default "Admin 域名" "${ADMIN_DOMAIN:-admin.example.com}")"
-  [[ "${user_domain}" == "${admin_domain}" ]] && { error "两个域名不能相同"; return 1; }
+  api_domain="$(prompt_with_default "API 域名" "${API_DOMAIN:-api.example.com}")"
+  [[ "${user_domain}" == "${admin_domain}" || "${user_domain}" == "${api_domain}" || "${admin_domain}" == "${api_domain}" ]] && {
+    error "三个域名不能相同"; return 1;
+  }
   acme_email="$(prompt_with_default "ACME 邮箱" "admin@${user_domain}")"
 
   precheck_https_common "${user_domain}" "${admin_domain}"
+  ensure_domain_resolved "${api_domain}"
+  install_or_prepare_acme_sh "${acme_email}"
+  auto_install_nginx
 
-  local caddy_dir="${install_dir}/caddy"
-  local https_compose="${install_dir}/docker-compose.https.yml"
-  mkdir -p "${caddy_dir}" "${install_dir}/data/caddy/data" "${install_dir}/data/caddy/config"
-  backup_file "${caddy_dir}/Caddyfile"; backup_file "${https_compose}"
+  api_port="$(get_saved_env_value "API_PORT" "8080")"
+  user_port="$(get_saved_env_value "USER_PORT" "8081")"
+  admin_port="$(get_saved_env_value "ADMIN_PORT" "8082")"
 
-  write_docker_https_caddyfile "${caddy_dir}/Caddyfile" "${user_domain}" "${admin_domain}" "${acme_email}"
-  write_docker_https_compose_file "${https_compose}"
+  info "申请 SSL 证书并配置 Nginx HTTPS..."
+  setup_ssl_with_nginx \
+    "${user_domain}" "${admin_domain}" "${api_domain}" \
+    "${user_port}" "${admin_port}" "${api_port}" \
+    "${install_dir}" "${acme_email}" || {
+    error "Docker HTTPS 配置失败"
+    print_fail_author; return 1
+  }
 
-  info "启动 Caddy HTTPS..."
-  if ! docker compose --env-file "${env_file}" -f "${base_compose}" -f "${https_compose}" up -d caddy; then
-    restore_file_if_needed "${caddy_dir}/Caddyfile"; restore_file_if_needed "${https_compose}"
-    error "HTTPS 启动失败，已回滚配置"; print_fail_author; return 1
-  fi
-
-  save_https_state "docker-caddy" "${user_domain}" "${admin_domain}" "acme-http01" ""
+  save_https_state "docker-nginx-ssl" "${user_domain}" "${admin_domain}" "acme-http01" "${api_domain}"
   success "Docker HTTPS 已启用"
   echo ""
   echo "  User  HTTPS: https://${user_domain}"
   echo "  Admin HTTPS: https://${admin_domain}"
+  echo "  API   HTTPS: https://${api_domain}"
   print_author
 }
 
@@ -2112,18 +2467,19 @@ install_or_prepare_acme_sh() {
   local acme_bin="${HOME}/.acme.sh/acme.sh"
   local acme_version="${ACME_SH_VERSION:-3.1.1}"
   local acme_url="https://raw.githubusercontent.com/acmesh-official/acme.sh/${acme_version}/acme.sh"
-  local tmp_file expected_sha actual_sha
+  local tmp_dir tmp_file expected_sha actual_sha
   [[ -x "${acme_bin}" ]] && return 0
   info "安装 acme.sh..."
-  tmp_file="$(mktemp)"
+  tmp_dir="$(mktemp -d)"
+  tmp_file="${tmp_dir}/acme.sh"
   if ! curl --proto '=https' --tlsv1.2 -fsSL "${acme_url}" -o "${tmp_file}"; then
-    rm -f "${tmp_file}"
+    rm -rf "${tmp_dir}"
     error "acme.sh 下载失败"
     return 1
   fi
   if ! grep -Eq '^PROJECT_NAME=["'\'']acme\.sh["'\'']$' "${tmp_file}" || \
      ! grep -q 'DEFAULT_INSTALL_HOME=' "${tmp_file}"; then
-    rm -f "${tmp_file}"
+    rm -rf "${tmp_dir}"
     error "acme.sh 下载内容校验失败"
     return 1
   fi
@@ -2131,19 +2487,26 @@ install_or_prepare_acme_sh() {
   if [[ -n "${expected_sha}" ]]; then
     actual_sha="$(sha256sum "${tmp_file}" | awk '{print $1}')"
     if [[ "${actual_sha}" != "${expected_sha}" ]]; then
-      rm -f "${tmp_file}"
+      rm -rf "${tmp_dir}"
       error "acme.sh SHA256 校验失败"
       return 1
     fi
   else
     warn "未设置 ACME_SH_INSTALL_SHA256，已跳过 SHA256 校验"
   fi
-  if ! sh "${tmp_file}" --install --home "${HOME}/.acme.sh" --accountemail "${1}"; then
-    rm -f "${tmp_file}"
+  chmod +x "${tmp_file}"
+  if ! (cd "${tmp_dir}" && sh ./acme.sh --install --home "${HOME}/.acme.sh" --accountemail "${1}"); then
+    rm -rf "${tmp_dir}"
     error "acme.sh 安装失败"
     return 1
   fi
-  rm -f "${tmp_file}"
+  rm -rf "${tmp_dir}"
+}
+
+acme_ecc_cert_ready() {
+  local domain="$1"
+  local base="${HOME}/.acme.sh/${domain}_ecc"
+  [[ -f "${base}/${domain}.key" && -f "${base}/fullchain.cer" ]]
 }
 
 enable_https_for_binary() {
@@ -2161,6 +2524,11 @@ enable_https_for_binary() {
   precheck_https_common "${user_domain}" "${admin_domain}"
   ensure_domain_resolved "${api_domain}"
   install_or_prepare_acme_sh "${acme_email}"
+  ensure_https_firewall_ports
+  confirm_cloud_firewall_ports || {
+    error "已取消证书申请，请先放行云安全组 80/443 后再重试"
+    return 1
+  }
 
   local api_port; api_port="$(get_saved_api_port)"
   local acme_bin="${HOME}/.acme.sh/acme.sh"
@@ -2185,6 +2553,19 @@ enable_https_for_binary() {
       fi
       warn "证书已存在，继续安装: ${domain}"
     fi
+    if ! acme_ecc_cert_ready "${domain}"; then
+      warn "未检测到可安装的 ECC 证书，尝试重新签发: ${domain}"
+      _issue_out="$("${acme_bin}" --issue --server letsencrypt -d "${domain}" -w "${webroot}" --keylength ec-256 --force 2>&1)" || true
+      if ! echo "${_issue_out}" | grep -qE "Cert success|Your cert is in"; then
+        error "证书重新签发失败: ${domain}"
+        echo "${_issue_out}" >&2
+        return 1
+      fi
+    fi
+    if ! acme_ecc_cert_ready "${domain}"; then
+      error "证书文件不存在，无法安装: ${domain}"
+      return 1
+    fi
     "${acme_bin}" --install-cert -d "${domain}" --ecc \
       --key-file "${cert_dir}/privkey.pem" \
       --fullchain-file "${cert_dir}/fullchain.pem" \
@@ -2193,6 +2574,7 @@ enable_https_for_binary() {
   done
 
   # API 域名：临时停 Nginx，用 standalone 模式申请
+  auto_install_socat || return 1
   info "临时停止 Nginx 申请 API 域名证书..."
   systemctl stop nginx 2>/dev/null || service nginx stop 2>/dev/null || true
   sleep 1
@@ -2210,6 +2592,21 @@ enable_https_for_binary() {
       return 1
     fi
     warn "证书已存在，继续安装: ${api_domain}"
+  fi
+  if ! acme_ecc_cert_ready "${api_domain}"; then
+    warn "未检测到可安装的 ECC 证书，尝试重新签发: ${api_domain}"
+    _issue_api="$("${acme_bin}" --issue --server letsencrypt -d "${api_domain}" --standalone --keylength ec-256 --force --accountemail "${acme_email}" 2>&1)" || true
+    if ! echo "${_issue_api}" | grep -qE "Cert success|Your cert is in"; then
+      error "API 域名 ECC 证书重新签发失败: ${api_domain}"
+      echo "${_issue_api}" >&2
+      systemctl start nginx 2>/dev/null || service nginx start 2>/dev/null || true
+      return 1
+    fi
+  fi
+  if ! acme_ecc_cert_ready "${api_domain}"; then
+    error "API 域名证书文件不存在，无法安装: ${api_domain}"
+    systemctl start nginx 2>/dev/null || service nginx start 2>/dev/null || true
+    return 1
   fi
   "${acme_bin}" --install-cert -d "${api_domain}" --ecc \
     --key-file "${api_cert_dir}/privkey.pem" \
@@ -2531,25 +2928,46 @@ do_backup() {
   local db_mode="${DB_MODE:-sqlite}"
   local backup_dir="${install_dir}/backups"
   local ts; ts="$(date '+%Y%m%d_%H%M%S')"
+  local uploads_archive="${backup_dir}/uploads_${ts}.tar.gz"
+  local sqlite_backup="${backup_dir}/dujiao_${ts}.db"
+  local postgres_backup="${backup_dir}/postgres_${ts}.sql"
+  local uploads_ok=false
+  local db_ok=false
+  local db_attempted=false
   mkdir -p "${backup_dir}"
 
   info "正在备份上传文件..."
-  tar -czf "${backup_dir}/uploads_${ts}.tar.gz" -C "${install_dir}" data/uploads 2>/dev/null \
-    || tar -czf "${backup_dir}/uploads_${ts}.tar.gz" -C "${install_dir}" uploads 2>/dev/null \
-    || warn "未找到上传文件目录，已跳过"
+  if tar -czf "${uploads_archive}" -C "${install_dir}" data/uploads 2>/dev/null \
+    || tar -czf "${uploads_archive}" -C "${install_dir}" uploads 2>/dev/null; then
+    uploads_ok=true
+  else
+    rm -f "${uploads_archive}"
+    warn "未找到上传文件目录，已跳过"
+  fi
 
   if [[ "${db_mode}" == "sqlite" ]]; then
+    db_attempted=true
     info "正在备份 SQLite 数据库..."
-    find "${install_dir}" -name "*.db" -exec cp {} "${backup_dir}/dujiao_${ts}.db" \; 2>/dev/null || warn "未找到 SQLite 数据库文件"
+    if find "${install_dir}" -name "*.db" -exec cp {} "${sqlite_backup}" \; 2>/dev/null; then
+      db_ok=true
+    else
+      rm -f "${sqlite_backup}"
+      warn "未找到 SQLite 数据库文件"
+    fi
   elif [[ "${db_mode}" == "postgres" ]]; then
+    db_attempted=true
     info "正在备份 PostgreSQL 数据库..."
     local pg_host="${POSTGRES_HOST:-postgres}"
     local pg_port="${POSTGRES_PORT:-5432}"
     local pg_db="${POSTGRES_DB_NAME:-dujiao_next}"
     local pg_user="${POSTGRES_DB_USER:-dujiao}"
     if [[ "${mode}" == "docker" ]]; then
-      docker exec "${pg_host}" pg_dump -U "${pg_user}" "${pg_db}" > "${backup_dir}/postgres_${ts}.sql" 2>/dev/null \
-        || warn "PostgreSQL 备份失败，请检查容器状态"
+      if run_compose_cmd exec -T postgres sh -lc "PGPASSWORD=\"\${POSTGRES_PASSWORD:-}\" pg_dump -U \"${pg_user}\" \"${pg_db}\"" > "${postgres_backup}" 2>/dev/null; then
+        db_ok=true
+      else
+        rm -f "${postgres_backup}"
+        warn "PostgreSQL 备份失败，请检查数据库容器状态或连接配置"
+      fi
     else
       if ! command -v pg_dump >/dev/null 2>&1; then
         warn "pg_dump 不可用，无法备份外部 PostgreSQL"
@@ -2558,17 +2976,32 @@ do_backup() {
         printf '%s' "  PostgreSQL 密码（留空则使用当前环境变量）: " >&2
         read -r pg_password
         if [[ -n "${pg_password}" ]]; then
-          PGPASSWORD="${pg_password}" pg_dump -h "${pg_host}" -p "${pg_port}" -U "${pg_user}" "${pg_db}" > "${backup_dir}/postgres_${ts}.sql" \
-            || warn "PostgreSQL 备份失败，请检查连接配置"
+          if PGPASSWORD="${pg_password}" pg_dump -h "${pg_host}" -p "${pg_port}" -U "${pg_user}" "${pg_db}" > "${postgres_backup}"; then
+            db_ok=true
+          else
+            rm -f "${postgres_backup}"
+            warn "PostgreSQL 备份失败，请检查连接配置"
+          fi
         else
-          pg_dump -h "${pg_host}" -p "${pg_port}" -U "${pg_user}" "${pg_db}" > "${backup_dir}/postgres_${ts}.sql" \
-            || warn "PostgreSQL 备份失败，请检查连接配置"
+          if pg_dump -h "${pg_host}" -p "${pg_port}" -U "${pg_user}" "${pg_db}" > "${postgres_backup}"; then
+            db_ok=true
+          else
+            rm -f "${postgres_backup}"
+            warn "PostgreSQL 备份失败，请检查连接配置"
+          fi
         fi
       fi
     fi
   fi
 
-  success "备份完成：${backup_dir}"
+  if ${uploads_ok} && ( ! ${db_attempted} || ${db_ok} ); then
+    success "备份完成：${backup_dir}"
+  elif ${uploads_ok} || ${db_ok}; then
+    warn "备份部分完成：${backup_dir}"
+  else
+    error "备份失败：${backup_dir}"
+    return 1
+  fi
   ls -lh "${backup_dir}/" | tail -5
 }
 
