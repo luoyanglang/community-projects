@@ -20,11 +20,6 @@ It supports:
 
 This project is published as an independent community script and does not replace the official community deployment script.
 
-## Video Tutorial
-
-- Bilibili walkthrough video
-  https://www.bilibili.com/video/BV1W2wtzkEXr
-
 ## Use Cases
 
 This script is a good fit for:
