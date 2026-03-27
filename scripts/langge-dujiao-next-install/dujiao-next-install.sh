@@ -425,8 +425,8 @@ clear_state_vars() {
 
 write_state_file() {
   local values=(
-    "${1}" "${2}" "${3}" "${4}" "${5}" "${6}" "${7}" "${8}" "${9}" "${10}"
-    "${11}" "${12}" "${13}" "${14}" "${15}" "${16}" "${17}" "${18}" "${19}"
+    "${1-}" "${2-}" "${3-}" "${4-}" "${5-}" "${6-}" "${7-}" "${8-}" "${9-}" "${10-}"
+    "${11-}" "${12-}" "${13-}" "${14-}" "${15-}" "${16-}" "${17-}" "${18-}" "${19-}"
   )
   local i
   ensure_state_dir
@@ -2768,7 +2768,7 @@ update_binary() {
 
   # 更新状态
   write_state_file "binary" "${install_dir}" "${new_tag}" "${new_tag}" "${new_tag}" \
-    "sqlite" "$(date '+%Y-%m-%d %H:%M:%S')" \
+    "${DB_MODE:-sqlite}" "$(date '+%Y-%m-%d %H:%M:%S')" \
     "${HTTPS_ENABLED:-false}" "${HTTPS_MODE:-}" \
     "${USER_DOMAIN:-}" "${ADMIN_DOMAIN:-}" \
     "${CERT_PROVIDER:-}" "${HTTPS_UPDATED_AT:-}" \
@@ -2818,7 +2818,7 @@ do_update() {
         "${USER_DOMAIN:-}" "${ADMIN_DOMAIN:-}" \
         "${CERT_PROVIDER:-}" "${HTTPS_UPDATED_AT:-}" \
         "${API_PORT:-}" "${POSTGRES_HOST:-}" "${POSTGRES_PORT:-}" \
-        "${POSTGRES_DB_NAME:-}" "${POSTGRES_DB_USER:-}"
+        "${POSTGRES_DB_NAME:-}" "${POSTGRES_DB_USER:-}" "${API_DOMAIN:-}"
       success "更新完成：${new_tag}"
       ;;
     external)
@@ -2836,7 +2836,7 @@ do_update() {
         "${USER_DOMAIN:-}" "${ADMIN_DOMAIN:-}" \
         "${CERT_PROVIDER:-}" "${HTTPS_UPDATED_AT:-}" \
         "${API_PORT:-}" "${POSTGRES_HOST:-}" "${POSTGRES_PORT:-}" \
-        "${POSTGRES_DB_NAME:-}" "${POSTGRES_DB_USER:-}"
+        "${POSTGRES_DB_NAME:-}" "${POSTGRES_DB_USER:-}" "${API_DOMAIN:-}"
       success "更新完成：${new_tag}"
       ;;
     binary)
