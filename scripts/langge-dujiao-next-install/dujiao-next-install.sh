@@ -135,6 +135,56 @@ ask_yes_no() {
   done
 }
 
+run_with_heartbeat() {
+  local message="$1" interval="${2:-15}"
+  shift 2
+
+  "$@" &
+  local cmd_pid=$!
+  local elapsed=0
+
+  while kill -0 "${cmd_pid}" 2>/dev/null; do
+    sleep "${interval}"
+    elapsed=$((elapsed + interval))
+    if kill -0 "${cmd_pid}" 2>/dev/null; then
+      info "${message}（已运行 ${elapsed}s）"
+    fi
+  done
+
+  wait "${cmd_pid}"
+}
+
+apt_noninteractive() {
+  DEBIAN_FRONTEND=noninteractive apt-get "$@"
+}
+
+warn_remote_shell_stability() {
+  if [[ -n "${SSH_CONNECTION:-}" && -z "${TMUX:-}" && -z "${STY:-}" ]]; then
+    warn "检测到当前通过 SSH 直接执行。脚本会在长耗时步骤中输出保活提示，但仍建议使用 tmux/screen 以防链路中断。"
+  fi
+}
+
+get_os_release_field() {
+  local field="$1"
+  [[ -r /etc/os-release ]] || return 1
+  awk -F= -v key="${field}" '$1 == key { gsub(/^"/, "", $2); gsub(/"$/, "", $2); print tolower($2); exit }' /etc/os-release
+}
+
+get_linux_pretty_name() {
+  local pretty_name
+  pretty_name="$(get_os_release_field "PRETTY_NAME" 2>/dev/null || true)"
+  [[ -n "${pretty_name}" ]] && printf '%s' "${pretty_name}" || printf '%s' "unknown linux"
+}
+
+is_supported_hardening_distro() {
+  local distro_id
+  distro_id="$(get_os_release_field "ID" 2>/dev/null || true)"
+  case "${distro_id}" in
+    debian|ubuntu) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 random_string() {
   local length="${1:-32}"
   if command_exists openssl; then
@@ -722,6 +772,38 @@ select_docker_database_mode() {
       1) _DB_MODE="sqlite";   return 0 ;;
       2) _DB_MODE="postgres"; return 0 ;;
       *) warn "无效选项: ${choice}，请输入 1 或 2" ;;
+    esac
+  done
+}
+
+select_root_ssh_login_mode() {
+  local choice=""
+  while true; do
+    print_line
+    echo "  请选择 root SSH 登录方式："
+    print_line
+    echo "  1) 密码 + 密钥（兼容模式，默认）"
+    echo "  2) 仅密钥登录（更安全，将禁止 root 密码 SSH 登录）"
+    print_line
+    printf '  请输入选项 [1-2] (默认 1): ' >&2
+    read -r choice
+    choice="$(trim "${choice:-1}")"
+    case "${choice}" in
+      1)
+        _ROOT_SSH_LOGIN_MODE="yes"
+        _ROOT_SSH_LOGIN_MODE_LABEL="密码 + 密钥"
+        return 0
+        ;;
+      2)
+        if ask_yes_no "确认仅允许 root 使用密钥登录（请确保已有可用密钥或其他管理入口）" "n"; then
+          _ROOT_SSH_LOGIN_MODE="prohibit-password"
+          _ROOT_SSH_LOGIN_MODE_LABEL="仅密钥登录"
+          return 0
+        fi
+        ;;
+      *)
+        warn "无效选项: ${choice}，请输入 1 或 2"
+        ;;
     esac
   done
 }
@@ -3176,6 +3258,14 @@ check_updates() {
 # 系统安全加固
 # ══════════════════════════════════════════════════
 do_security_hardening() {
+  local distro_name
+  distro_name="$(get_linux_pretty_name)"
+  if ! is_supported_hardening_distro; then
+    error "系统加固当前仅支持 Debian/Ubuntu，检测到当前系统为: ${distro_name}"
+    warn "请不要在当前发行版上继续执行此加固流程，以免出现包管理器或配置差异导致的问题。"
+    return 1
+  fi
+
   print_line
   echo "  ${BOLD}系统安全加固${NC}"
   echo "  ${DIM}适用于 Debian/Ubuntu 系统${NC}"
@@ -3190,33 +3280,41 @@ do_security_hardening() {
   print_line
   echo "  ${BOLD}端口设置${NC}"
   print_line
-  local ssh_port panel_port custom_ports
+  local ssh_port panel_port custom_ports root_ssh_login_mode root_ssh_login_mode_label
   ssh_port="$(prompt_with_default "SSH 端口（重要）" "22")"
   panel_port="$(prompt_with_default "面板端口（可选）" "")"
-  custom_ports="$(prompt_with_default "额外开放端口（逗号分隔）" "")"
+  custom_ports="$(prompt_with_default "额外开放端口（逗号分隔，80/443 默认已放行）" "")"
+  select_root_ssh_login_mode
+  root_ssh_login_mode="${_ROOT_SSH_LOGIN_MODE}"
+  root_ssh_login_mode_label="${_ROOT_SSH_LOGIN_MODE_LABEL}"
   if ! validate_port_number "${ssh_port}"; then
     error "SSH 端口无效: ${ssh_port}"
+    return 1
+  fi
+  if [[ -n "${panel_port}" ]] && ! validate_port_number "${panel_port}"; then
+    error "面板端口无效: ${panel_port}"
     return 1
   fi
 
   echo ""
   info "开始执行加固任务..."
+  warn_remote_shell_stability
 
   info "检查并安装 Lynis..."
   if ! command_exists lynis; then
-    DEBIAN_FRONTEND=noninteractive apt-get update -y -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y lynis
+    run_with_heartbeat "正在更新软件源，请耐心等待" 15 apt_noninteractive update -y -qq
+    run_with_heartbeat "正在安装 Lynis，请耐心等待" 15 apt_noninteractive install -y lynis
   fi
   success "Lynis 已就绪: $(lynis --version 2>&1 | head -n1)"
 
   info "更新系统软件包..."
-  DEBIAN_FRONTEND=noninteractive apt-get update -y -qq
-  DEBIAN_FRONTEND=noninteractive apt-get upgrade -y -qq \
+  run_with_heartbeat "正在更新软件源，请耐心等待" 15 apt_noninteractive update -y -qq
+  run_with_heartbeat "系统升级进行中，请保持会话开启" 15 apt_noninteractive upgrade -y -qq \
     -o Dpkg::Options::="--force-confdef" \
     -o Dpkg::Options::="--force-confold"
 
   info "启用自动安全更新..."
-  DEBIAN_FRONTEND=noninteractive apt-get install -y unattended-upgrades -qq
+  run_with_heartbeat "正在安装自动安全更新组件，请耐心等待" 15 apt_noninteractive install -y unattended-upgrades -qq
   cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'EOF'
 Unattended-Upgrade::Allowed-Origins {
     "${distro_id}:${distro_codename}-security";
@@ -3236,14 +3334,15 @@ EOF
   systemctl start unattended-upgrades 2>/dev/null || true
   success "自动安全更新已启用"
 
-  DEBIAN_FRONTEND=noninteractive apt-get install -y libpam-tmpdir -qq
+  run_with_heartbeat "正在安装 libpam-tmpdir，请耐心等待" 15 apt_noninteractive install -y libpam-tmpdir -qq
   success "libpam-tmpdir 已安装"
 
   info "加固 SSH..."
   local SSHD=/etc/ssh/sshd_config
   local sshd_backup="${SSHD}.bak"
   backup_file "${SSHD}"
-  set_config_kv "${SSHD}" "PermitRootLogin" "prohibit-password"
+  set_config_kv "${SSHD}" "PermitRootLogin" "${root_ssh_login_mode}"
+  set_config_kv "${SSHD}" "PasswordAuthentication" "yes"
   set_config_kv "${SSHD}" "PermitEmptyPasswords" "no"
   set_config_kv "${SSHD}" "MaxAuthTries" "3"
   set_config_kv "${SSHD}" "LoginGraceTime" "20"
@@ -3253,9 +3352,9 @@ EOF
   set_config_kv "${SSHD}" "Compression" "no"
   set_config_kv "${SSHD}" "LogLevel" "VERBOSE"
   set_config_kv "${SSHD}" "MaxSessions" "2"
-  set_config_kv "${SSHD}" "TCPKeepAlive" "no"
-  set_config_kv "${SSHD}" "ClientAliveInterval" "300"
-  set_config_kv "${SSHD}" "ClientAliveCountMax" "2"
+  set_config_kv "${SSHD}" "TCPKeepAlive" "yes"
+  set_config_kv "${SSHD}" "ClientAliveInterval" "60"
+  set_config_kv "${SSHD}" "ClientAliveCountMax" "3"
   set_config_kv "${SSHD}" "Port" "${ssh_port}"
   if ! test_sshd_config "${SSHD}"; then
     [[ -f "${sshd_backup}" ]] && cp -f "${sshd_backup}" "${SSHD}"
@@ -3268,10 +3367,10 @@ EOF
     error "SSH 重启失败，已回滚到原配置"
     return 1
   fi
-  success "SSH 加固完成（端口: ${ssh_port}）"
+  success "SSH 加固完成（端口: ${ssh_port}，root 登录方式: ${root_ssh_login_mode_label}）"
 
   info "配置 rsyslog..."
-  DEBIAN_FRONTEND=noninteractive apt-get install -y rsyslog logrotate -qq
+  run_with_heartbeat "正在安装 rsyslog / logrotate，请耐心等待" 15 apt_noninteractive install -y rsyslog logrotate -qq
   sed -i 's/\$FileCreateMode.*/\$FileCreateMode 0640/' /etc/rsyslog.conf 2>/dev/null || true
   systemctl restart rsyslog 2>/dev/null || true
   success "rsyslog 配置完成"
@@ -3297,7 +3396,7 @@ EOF
   success "文件权限已更新"
 
   info "安装并配置 Fail2ban..."
-  DEBIAN_FRONTEND=noninteractive apt-get install -y fail2ban -qq
+  run_with_heartbeat "正在安装 Fail2ban，请耐心等待" 15 apt_noninteractive install -y fail2ban -qq
   cat > /etc/fail2ban/jail.local << EOF
 [DEFAULT]
 bantime = 3600
@@ -3319,7 +3418,7 @@ EOF
   local ufw_after_rules=/etc/ufw/after.rules
   local ufw_after_rules_backup="${ufw_after_rules}.bak"
   local ufw_was_active="false"
-  DEBIAN_FRONTEND=noninteractive apt-get install -y ufw -qq
+  run_with_heartbeat "正在安装 UFW，请耐心等待" 15 apt_noninteractive install -y ufw -qq
   backup_file "${ufw_after_rules}"
   [[ -f "${ufw_after_rules_backup}" ]] || : > "${ufw_after_rules_backup}"
   if ufw status 2>/dev/null | grep -q '^Status: active'; then
@@ -3336,7 +3435,18 @@ EOF
     IFS=',' read -ra ports <<< "${custom_ports}"
     for p in "${ports[@]}"; do
       p="$(trim "${p}")"
-      [[ -n "${p}" ]] && ufw allow "${p}/tcp" comment 'Custom'
+      [[ -n "${p}" ]] || continue
+      if ! validate_port_number "${p}"; then
+        warn "跳过无效的额外端口: ${p}"
+        continue
+      fi
+      case " 80 443 ${ssh_port} ${panel_port:-} " in
+        *" ${p} "*)
+          info "额外端口 ${p} 已在默认放行列表中，跳过重复配置"
+          continue
+          ;;
+      esac
+      ufw allow "${p}/tcp" comment 'Custom'
     done
   fi
   if [[ "${ufw_was_active}" == "true" ]]; then
@@ -3387,7 +3497,7 @@ EOF
   success "附加安全加固已完成"
 
   info "配置密码策略..."
-  DEBIAN_FRONTEND=noninteractive apt-get install -y libpam-pwquality debsums apt-show-versions -qq
+  run_with_heartbeat "正在安装密码策略组件，请耐心等待" 15 apt_noninteractive install -y libpam-pwquality debsums apt-show-versions -qq
   cat > /etc/security/pwquality.conf << 'EOF'
 minlen = 12
 lcredit = -1
@@ -3404,7 +3514,7 @@ EOF
   echo "  ${G}${BOLD}系统安全加固完成${NC}"
   print_line
   echo "  - 已启用自动安全更新"
-  echo "  - 已完成 SSH 加固（端口: ${ssh_port}）"
+  echo "  - 已完成 SSH 加固（端口: ${ssh_port}，root 登录方式: ${root_ssh_login_mode_label}）"
   echo "  - 已配置 Fail2ban"
   echo "  - 已配置 UFW 防火墙"
   echo "  - 已应用内核/文件/密码策略加固"

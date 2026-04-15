@@ -204,8 +204,12 @@ Capabilities include:
 Capabilities include:
 
 - SSH / panel / custom port setup
+- Root SSH login mode selection:
+  - password + key (compatibility mode)
+  - key-only login (more secure)
 - Lynis install and checks
 - Package upgrade and unattended upgrades
+- Progress heartbeat during long package operations to reduce the risk of idle SSH disconnects
 - SSH baseline hardening
 - `sshd_config` validation and rollback
 - `rsyslog` setup
@@ -217,6 +221,7 @@ Capabilities include:
 - UFW rollback on failure
 - Disable risky protocols and USB storage
 - Password policy and login restrictions
+- System hardening is blocked on unsupported distros and currently only available for Debian / Ubuntu
 
 ## Safety Notes
 
@@ -238,6 +243,7 @@ Please be aware of the following:
   - Fail2ban
   - password policies
   - kernel hardening settings
+- if you choose key-only mode, root SSH password login will be rejected even when the password itself is correct
 - binary deployment writes a systemd unit
 - default admin credentials are for bootstrap only and must be changed immediately
 
@@ -247,6 +253,8 @@ Recommended:
 - take snapshots or backups before running in production
 - run the hardening menu only on a controllable or rollback-friendly server
 - confirm security-group and firewall rules before changing SSH ports
+- when running hardening over remote SSH, it is still recommended to use `tmux` or `screen`
+- do not use the hardening menu on non-Debian / Ubuntu systems
 
 ## Requirements
 
