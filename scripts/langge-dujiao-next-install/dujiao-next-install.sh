@@ -15,6 +15,8 @@ DUJIAO_ADMIN_REPO="dujiao-next/admin"
 # ── State ──────────────────────────────────────────
 STATE_DIR="${HOME}/.dujiao-next-one-click"
 STATE_FILE="${STATE_DIR}/state.env"
+MANAGED_REDIS_MARKER=".dujiao-managed-redis"
+MANAGED_POSTGRES_MARKER=".dujiao-managed-postgres"
 
 # ── Author ─────────────────────────────────────────
 AUTHOR_TG="https://t.me/luoyanglang"
@@ -207,6 +209,90 @@ validate_port_number() {
   local port="$1"
   [[ "${port}" =~ ^[0-9]+$ ]] || return 1
   (( port >= 1 && port <= 65535 ))
+}
+
+host_port_in_use() {
+  local port="$1"
+  if command_exists ss; then
+    ss -ltnH "( sport = :${port} )" 2>/dev/null | grep -q .
+    return $?
+  fi
+  if command_exists lsof; then
+    lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1
+    return $?
+  fi
+  if command_exists netstat; then
+    netstat -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "[:.]${port}$"
+    return $?
+  fi
+  return 1
+}
+
+show_host_port_owner() {
+  local port="$1"
+  if command_exists ss; then
+    ss -ltnp "( sport = :${port} )" 2>/dev/null || true
+  elif command_exists lsof; then
+    lsof -nP -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null || true
+  elif command_exists netstat; then
+    netstat -ltnp 2>/dev/null | grep -E "[:.]${port}[[:space:]]" || true
+  fi
+}
+
+prompt_available_host_port() {
+  local label="$1" default_port="$2" services="$3"
+  local port choice service
+  while true; do
+    port="$(prompt_with_default "${label} 端口" "${default_port}")"
+    validate_port_number "${port}" || {
+      error "无效的 ${label} 端口: ${port}"
+      continue
+    }
+    if ! host_port_in_use "${port}"; then
+      _HOST_PORT_VALUE="${port}"
+      return 0
+    fi
+
+    error "${label} 端口 ${port} 已被宿主机占用，Docker 容器无法绑定该端口"
+    show_host_port_owner "${port}"
+    print_line
+    echo "  请选择处理方式："
+    echo "  1) 停止并禁用宿主机 ${label} 服务后继续（适合旧脚本残留）"
+    echo "  2) 重新输入 ${label} 端口"
+    echo "  3) 取消部署（默认）"
+    print_line
+    printf '%s' "  请输入选项 [1-3] (默认 3): " >&2
+    read -r choice
+    choice="$(trim "${choice}")"
+    case "${choice}" in
+      1)
+        for service in ${services}; do
+          systemctl stop "${service}" 2>/dev/null || true
+          systemctl disable "${service}" 2>/dev/null || true
+        done
+        sleep 1
+        if host_port_in_use "${port}"; then
+          error "${label} 端口 ${port} 仍被占用，请检查占用进程后重试"
+          show_host_port_owner "${port}"
+          return 1
+        fi
+        success "宿主机 ${label} 服务已停用"
+        _HOST_PORT_VALUE="${port}"
+        return 0
+        ;;
+      2)
+        default_port="${port}"
+        continue
+        ;;
+      ""|3)
+        error "已取消安装。请先处理 ${label} 端口占用，或重新运行脚本选择其他端口。"
+        return 1
+        ;;
+      *)
+        warn "无效选项: ${choice}，请输入 1、2 或 3"
+        ;;
+    esac
+  done
 }
 
 set_config_kv() {
@@ -1635,11 +1721,19 @@ deploy_with_docker() {
   api_port="$(prompt_with_default "API 端口" "8080")"
   user_port="$(prompt_with_default "User 端口" "8081")"
   admin_port="$(prompt_with_default "Admin 端口" "8082")"
-  redis_port="$(prompt_with_default "Redis 端口" "6379")"
+  _HOST_PORT_VALUE=""
+  prompt_available_host_port "Redis" "6379" "redis-server redis" || {
+    print_fail_author; return 1
+  }
+  redis_port="${_HOST_PORT_VALUE}"
   redis_password="$(prompt_with_default "Redis 密码" "$(random_string 16)")"
 
   if [[ "${db_mode}" == "postgres" ]]; then
-    postgres_port="$(prompt_with_default "PostgreSQL 端口" "5432")"
+    _HOST_PORT_VALUE=""
+    prompt_available_host_port "PostgreSQL" "5432" "postgresql" || {
+      print_fail_author; return 1
+    }
+    postgres_port="${_HOST_PORT_VALUE}"
     postgres_db="$(prompt_with_default "数据库名" "dujiao_next")"
     postgres_user="$(prompt_with_default "数据库用户名" "dujiao")"
     postgres_password="$(prompt_with_default "数据库密码" "$(random_string 16)")"
@@ -1915,6 +2009,127 @@ run_psql_as_postgres() {
   fi
 }
 
+detect_postgres_utf8_locale() {
+  local candidate
+  for candidate in C.UTF-8 C.utf8 en_US.UTF-8 en_US.utf8; do
+    if locale -a 2>/dev/null | grep -Fixq "${candidate}"; then
+      printf '%s' "${candidate}"
+      return 0
+    fi
+  done
+  printf 'C'
+}
+
+create_utf8_postgres_database() {
+  local pg_db="$1" pg_user="$2"
+  local utf8_locale
+  utf8_locale="$(detect_postgres_utf8_locale)"
+  run_psql_as_postgres "CREATE DATABASE \"${pg_db}\" WITH OWNER \"${pg_user}\" TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE '${utf8_locale}' LC_CTYPE '${utf8_locale}';"
+}
+
+validate_external_redis_connection() {
+  local network="$1" redis_host="$2" redis_port="$3" redis_password="$4"
+  local output
+  info "验证 Redis 连接与认证..."
+  if [[ -n "${redis_password}" ]]; then
+    output="$(docker run --rm --network "${network}" redis:7-alpine \
+      redis-cli -h "${redis_host}" -p "${redis_port}" --no-auth-warning -a "${redis_password}" PING 2>&1)" || {
+      error "Redis 连接或认证失败"
+      printf '%s\n' "${output}" | sed -E 's/(AUTH failed: ).*/\1<redacted>/'
+      warn "请确认 Redis 容器名、端口、密码与 1Panel/面板中的实际配置一致"
+      return 1
+    }
+  else
+    output="$(docker run --rm --network "${network}" redis:7-alpine \
+      redis-cli -h "${redis_host}" -p "${redis_port}" PING 2>&1)" || {
+      error "Redis 连接失败"
+      printf '%s\n' "${output}"
+      warn "如果 Redis 开启了密码，请在脚本中填写 Redis 密码；如果无密码，请确认 Redis 允许 Docker 网络访问"
+      return 1
+    }
+  fi
+  if [[ "${output}" != *"PONG"* ]]; then
+    error "Redis 验证未返回 PONG"
+    printf '%s\n' "${output}"
+    return 1
+  fi
+  success "Redis 连接验证通过"
+}
+
+validate_external_postgres_connection() {
+  local network="$1" pg_host="$2" pg_port="$3" pg_db="$4" pg_user="$5" pg_password="$6"
+  local output
+  info "验证 PostgreSQL 连接与认证..."
+  output="$(docker run --rm --network "${network}" -e PGPASSWORD="${pg_password}" postgres:16-alpine \
+    psql -h "${pg_host}" -p "${pg_port}" -U "${pg_user}" -d "${pg_db}" -c '\q' 2>&1)" || {
+    error "PostgreSQL 连接或认证失败"
+    printf '%s\n' "${output}" | sed -E 's/(password authentication failed for user ).*/\1<redacted>/'
+    warn "请确认 PostgreSQL 容器名、端口、数据库名、用户名和密码与面板中的实际配置一致"
+    return 1
+  }
+  success "PostgreSQL 连接验证通过"
+}
+
+collect_external_postgres_config() {
+  print_line
+  echo "  ${BOLD}🗄️  PostgreSQL 配置${NC}"
+  print_line
+  echo ""
+  info "当前运行中的容器（仅供参考）："
+  docker ps --format "  {{.Names}}\t{{.Image}}" 2>/dev/null | grep -i "postgres\|pg" || echo "  未找到 PostgreSQL 容器"
+  echo ""
+
+  local pg_host pg_port pg_db pg_user pg_password
+  while true; do
+    pg_host="$(prompt_with_default "PostgreSQL 容器名或IP" "${_EXT_PG_HOST:-1panel-postgresql}")"
+    pg_port="$(prompt_with_default "PostgreSQL 端口" "${_EXT_PG_PORT:-5432}")"
+    pg_db="$(prompt_with_default "数据库名" "${_EXT_PG_DB:-dujiao}")"
+    pg_user="$(prompt_with_default "数据库用户名" "${_EXT_PG_USER:-dujiao}")"
+    printf "  数据库密码 (无密码直接回车): " >&2
+    read -r -s pg_password
+    echo "" >&2
+    if validate_external_postgres_connection "${1}" "${pg_host}" "${pg_port}" "${pg_db}" "${pg_user}" "${pg_password}"; then
+      _EXT_PG_HOST="${pg_host}"
+      _EXT_PG_PORT="${pg_port}"
+      _EXT_PG_DB="${pg_db}"
+      _EXT_PG_USER="${pg_user}"
+      _EXT_PG_PASSWORD="${pg_password}"
+      return 0
+    fi
+    if ! ask_yes_no "PostgreSQL 验证失败，是否重新输入" "y"; then
+      return 1
+    fi
+  done
+}
+
+collect_external_redis_config() {
+  print_line
+  echo "  ${BOLD}📦 Redis 配置${NC}"
+  print_line
+  echo ""
+  info "当前运行中的容器（仅供参考）："
+  docker ps --format "  {{.Names}}\t{{.Image}}" 2>/dev/null | grep -i "redis" || echo "  未找到 Redis 容器"
+  echo ""
+
+  local redis_host redis_port redis_password
+  while true; do
+    redis_host="$(prompt_with_default "Redis 容器名或IP" "${_EXT_REDIS_HOST:-1panel-redis}")"
+    redis_port="$(prompt_with_default "Redis 端口" "${_EXT_REDIS_PORT:-6379}")"
+    printf "  Redis 密码 (无密码直接回车): " >&2
+    read -r -s redis_password
+    echo "" >&2
+    if validate_external_redis_connection "${1}" "${redis_host}" "${redis_port}" "${redis_password}"; then
+      _EXT_REDIS_HOST="${redis_host}"
+      _EXT_REDIS_PORT="${redis_port}"
+      _EXT_REDIS_PASSWORD="${redis_password}"
+      return 0
+    fi
+    if ! ask_yes_no "Redis 验证失败，是否重新输入" "y"; then
+      return 1
+    fi
+  done
+}
+
 auto_install_local_postgres() {
   if command_exists psql && command_exists pg_isready; then
     info "PostgreSQL 已安装"
@@ -1945,7 +2160,7 @@ auto_install_local_postgres() {
 }
 
 prepare_local_postgres_database() {
-  local pg_port="$1" pg_db="$2" pg_user="$3" pg_password="$4"
+  local pg_port="$1" pg_db="$2" pg_user="$3" pg_password="$4" pg_host="${5:-localhost}"
 
   validate_port_number "${pg_port}" || {
     error "无效的 PostgreSQL 端口: ${pg_port}"
@@ -1967,8 +2182,8 @@ prepare_local_postgres_database() {
     fi
   fi
 
-  if ! pg_isready -h 127.0.0.1 -p "${pg_port}" -q >/dev/null 2>&1; then
-    error "本机 PostgreSQL 未在 127.0.0.1:${pg_port} 就绪"
+  if ! pg_isready -h "${pg_host}" -p "${pg_port}" -q >/dev/null 2>&1; then
+    error "本机 PostgreSQL 未在 ${pg_host}:${pg_port} 就绪"
     return 1
   fi
 
@@ -1988,15 +2203,35 @@ prepare_local_postgres_database() {
     }
   fi
 
-  if [[ "$(run_psql_as_postgres "SELECT 1 FROM pg_database WHERE datname='${pg_db}';" 2>/dev/null)" == "1" ]]; then
-    warn "检测到数据库 ${pg_db} 已存在，将复用该数据库并校正属主"
+  local existing_db_encoding
+  existing_db_encoding="$(run_psql_as_postgres "SELECT pg_encoding_to_char(encoding) FROM pg_database WHERE datname='${pg_db}';" 2>/dev/null || true)"
+  if [[ -n "${existing_db_encoding}" ]]; then
+    if [[ "${existing_db_encoding}" != "UTF8" ]]; then
+      warn "检测到数据库 ${pg_db} 已存在，但编码为 ${existing_db_encoding}，Dujiao-Next 需要 UTF8"
+      if ask_yes_no "是否删除并重建数据库 ${pg_db}（会清空该库数据）" "n"; then
+        run_psql_as_postgres "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='${pg_db}' AND pid <> pg_backend_pid();" >/dev/null || true
+        run_psql_as_postgres "DROP DATABASE \"${pg_db}\";" >/dev/null || {
+          error "删除非 UTF8 PostgreSQL 数据库失败"
+          return 1
+        }
+        create_utf8_postgres_database "${pg_db}" "${pg_user}" >/dev/null || {
+          error "创建 UTF8 PostgreSQL 数据库失败"
+          return 1
+        }
+      else
+        error "已取消安装。请改用 UTF8 数据库，或备份后重建 ${pg_db}"
+        return 1
+      fi
+    else
+      warn "检测到数据库 ${pg_db} 已存在，将复用该数据库并校正属主"
+    fi
     run_psql_as_postgres "ALTER DATABASE \"${pg_db}\" OWNER TO \"${pg_user}\";" >/dev/null || {
       error "更新 PostgreSQL 数据库属主失败"
       return 1
     }
   else
-    run_psql_as_postgres "CREATE DATABASE \"${pg_db}\" OWNER \"${pg_user}\";" >/dev/null || {
-      error "创建 PostgreSQL 数据库失败"
+    create_utf8_postgres_database "${pg_db}" "${pg_user}" >/dev/null || {
+      error "创建 UTF8 PostgreSQL 数据库失败"
       return 1
     }
   fi
@@ -2006,7 +2241,7 @@ prepare_local_postgres_database() {
     return 1
   }
 
-  if ! PGPASSWORD="${pg_password}" psql -h 127.0.0.1 -p "${pg_port}" -U "${pg_user}" -d "${pg_db}" -c '\q' >/dev/null 2>&1; then
+  if ! PGPASSWORD="${pg_password}" psql -h "${pg_host}" -p "${pg_port}" -U "${pg_user}" -d "${pg_db}" -c '\q' >/dev/null 2>&1; then
     error "PostgreSQL 连接预检查失败，请确认用户/密码/端口配置"
     return 1
   fi
@@ -2063,6 +2298,7 @@ deploy_with_binary() {
     fi
   done
 
+  local redis_installed_by_script="false"
   if ! command_exists redis-server; then
     info "安装 Redis..."
     if command_exists apt-get; then
@@ -2073,6 +2309,7 @@ deploy_with_binary() {
       error "无法自动安装 Redis，请手动安装后重试"
       print_fail_author; return 1
     fi
+    redis_installed_by_script="true"
   fi
   systemctl enable redis-server 2>/dev/null || systemctl enable redis 2>/dev/null || true
   systemctl start redis-server 2>/dev/null || systemctl start redis 2>/dev/null || true
@@ -2086,6 +2323,7 @@ deploy_with_binary() {
 
   local install_dir tz api_port user_port admin_port admin_username admin_password
   local db_mode pg_host pg_port pg_db pg_user pg_password
+  local postgres_installed_by_script="false"
   _DB_MODE=""
   select_docker_database_mode
   db_mode="${_DB_MODE}"
@@ -2102,13 +2340,16 @@ deploy_with_binary() {
   admin_username="$(prompt_with_default "管理员用户名" "admin")"
   admin_password="$(prompt_with_default "管理员密码" "Admin@123456")"
   if [[ "${db_mode}" == "postgres" ]]; then
+    if ! command_exists psql || ! command_exists pg_isready; then
+      postgres_installed_by_script="true"
+    fi
     auto_install_local_postgres || return 1
-    pg_host="127.0.0.1"
+    pg_host="localhost"
     pg_port="$(prompt_with_default "PostgreSQL 端口" "5432")"
     pg_db="$(prompt_with_default "数据库名" "dujiao_next")"
     pg_user="$(prompt_with_default "数据库用户名" "dujiao")"
     pg_password="$(prompt_with_default "数据库密码" "$(random_string 16)")"
-    prepare_local_postgres_database "${pg_port}" "${pg_db}" "${pg_user}" "${pg_password}" || {
+    prepare_local_postgres_database "${pg_port}" "${pg_db}" "${pg_user}" "${pg_password}" "${pg_host}" || {
       print_fail_author; return 1
     }
   else
@@ -2121,6 +2362,20 @@ deploy_with_binary() {
     "${install_dir}/logs" "${install_dir}/acme-webroot" \
     "${install_dir}/certs"
   [[ "${db_mode}" == "sqlite" ]] && mkdir -p "${install_dir}/db"
+  if [[ "${redis_installed_by_script}" == "true" ]]; then
+    {
+      printf 'installed_by=dujiao-next-install\n'
+      printf 'installed_at=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    } > "${install_dir}/${MANAGED_REDIS_MARKER}"
+    chmod 600 "${install_dir}/${MANAGED_REDIS_MARKER}" 2>/dev/null || true
+  fi
+  if [[ "${postgres_installed_by_script}" == "true" ]]; then
+    {
+      printf 'installed_by=dujiao-next-install\n'
+      printf 'installed_at=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    } > "${install_dir}/${MANAGED_POSTGRES_MARKER}"
+    chmod 600 "${install_dir}/${MANAGED_POSTGRES_MARKER}" 2>/dev/null || true
+  fi
 
   # 确保 Nginx（www-data）能进入安装目录路径中的每一级
   # 逐级对父目录添加 o+x（进入权限），不影响文件读写安全性
@@ -2291,37 +2546,25 @@ deploy_external() {
   local user_port; user_port="$(prompt_with_default "User 端口" "3001")"
   local admin_port; admin_port="$(prompt_with_default "Admin 端口" "3000")"
 
-  echo ""
-  print_line
-  echo "  ${BOLD}🗄️  PostgreSQL 配置${NC}"
-  print_line
-  echo ""
-  info "当前运行中的容器（仅供参考）："
-  docker ps --format "  {{.Names}}\t{{.Image}}" 2>/dev/null | grep -i "postgres\|pg" || echo "  未找到 PostgreSQL 容器"
-  echo ""
   local pg_host pg_port pg_db pg_user pg_password
-  pg_host="$(prompt_with_default "PostgreSQL 容器名或IP" "1panel-postgresql")"
-  pg_port="$(prompt_with_default "PostgreSQL 端口" "5432")"
-  pg_db="$(prompt_with_default "数据库名" "dujiao")"
-  pg_user="$(prompt_with_default "数据库用户名" "dujiao")"
-  printf "  数据库密码 (无密码直接回车): " >&2
-  read -r -s pg_password
-  echo "" >&2
+  _EXT_PG_HOST="" _EXT_PG_PORT="" _EXT_PG_DB="" _EXT_PG_USER="" _EXT_PG_PASSWORD=""
+  collect_external_postgres_config "${panel_network}" || {
+    print_fail_author; return 1
+  }
+  pg_host="${_EXT_PG_HOST}"
+  pg_port="${_EXT_PG_PORT}"
+  pg_db="${_EXT_PG_DB}"
+  pg_user="${_EXT_PG_USER}"
+  pg_password="${_EXT_PG_PASSWORD}"
 
-  echo ""
-  print_line
-  echo "  ${BOLD}📦 Redis 配置${NC}"
-  print_line
-  echo ""
-  info "当前运行中的容器（仅供参考）："
-  docker ps --format "  {{.Names}}\t{{.Image}}" 2>/dev/null | grep -i "redis" || echo "  未找到 Redis 容器"
-  echo ""
   local redis_host redis_port redis_password
-  redis_host="$(prompt_with_default "Redis 容器名或IP" "1panel-redis")"
-  redis_port="$(prompt_with_default "Redis 端口" "6379")"
-  printf "  Redis 密码 (无密码直接回车): " >&2
-  read -r -s redis_password
-  echo "" >&2
+  _EXT_REDIS_HOST="" _EXT_REDIS_PORT="" _EXT_REDIS_PASSWORD=""
+  collect_external_redis_config "${panel_network}" || {
+    print_fail_author; return 1
+  }
+  redis_host="${_EXT_REDIS_HOST}"
+  redis_port="${_EXT_REDIS_PORT}"
+  redis_password="${_EXT_REDIS_PASSWORD}"
 
   local admin_username admin_password
   admin_username="$(prompt_with_default "管理员用户名" "admin")"
@@ -3164,6 +3407,22 @@ do_uninstall() {
       rm -f /etc/systemd/system/dujiao-next-api.service
       systemctl daemon-reload 2>/dev/null || true
       success "systemd 服务已移除"
+      if [[ -f "${install_dir}/${MANAGED_REDIS_MARKER}" ]]; then
+        info "停止脚本安装的 Redis 服务..."
+        systemctl stop redis-server 2>/dev/null || systemctl stop redis 2>/dev/null || true
+        systemctl disable redis-server 2>/dev/null || systemctl disable redis 2>/dev/null || true
+        success "Redis 服务已停用"
+      else
+        info "未发现脚本安装 Redis 标记，保留宿主机 Redis"
+      fi
+      if [[ -f "${install_dir}/${MANAGED_POSTGRES_MARKER}" ]]; then
+        info "停止脚本安装的 PostgreSQL 服务..."
+        systemctl stop postgresql 2>/dev/null || true
+        systemctl disable postgresql 2>/dev/null || true
+        success "PostgreSQL 服务已停用"
+      else
+        info "未发现脚本安装 PostgreSQL 标记，保留宿主机 PostgreSQL"
+      fi
       ;;
   esac
 
