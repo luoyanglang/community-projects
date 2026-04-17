@@ -83,6 +83,7 @@ Capabilities include:
 - Custom deploy directory, timezone, API/User/Admin ports
 - Redis port and password setup
 - PostgreSQL port / db / user / password setup
+- Host port pre-checks for Redis / PostgreSQL before Docker startup, with an explicit choice to stop old host services, re-enter the port, or cancel
 - Default admin username and password setup
 - Domain collection for User / Admin / API
 - Optional HTTPS and ACME email configuration
@@ -107,7 +108,7 @@ Capabilities include:
 - Extract and install API binary and frontend assets
 - Auto install local PostgreSQL when `PostgreSQL + Redis` is selected
 - Pre-check local PostgreSQL availability before writing config
-- Auto create / reuse PostgreSQL database and user
+- Auto create / reuse PostgreSQL database and user, enforcing UTF-8 encoding for newly created local databases
 - Generate API config, JWT, Redis, and queue settings
 - Configure default admin account
 - Write and enable a systemd service
@@ -124,7 +125,9 @@ Capabilities include:
 - Detect and choose existing Docker networks
 - Custom version tag, deploy directory, and ports
 - External PostgreSQL connection setup
+- PostgreSQL connectivity and credential validation from the selected Docker network
 - External Redis connection setup
+- Redis connectivity and password validation from the selected Docker network
 - Default admin account setup
 - Auto-generate `config.yml` and `docker-compose.yml`
 - Pull and start containers
@@ -189,6 +192,7 @@ Capabilities include:
   - failed
 - Docker cleanup
 - Full uninstall with install dir, state file, and Nginx cleanup
+- Binary uninstall also stops and disables Redis / PostgreSQL when they were installed by this script, preventing port conflicts when switching back to Docker mode
 
 ### 5. Check Versions
 
@@ -245,6 +249,8 @@ Please be aware of the following:
   - kernel hardening settings
 - if you choose key-only mode, root SSH password login will be rejected even when the password itself is correct
 - binary deployment writes a systemd unit
+- binary deployment may install and enable local Redis / PostgreSQL; uninstall only stops them when they were installed by this script
+- Dujiao-Next requires PostgreSQL databases to use UTF-8 encoding; non-UTF-8 existing databases must be backed up and recreated before use
 - default admin credentials are for bootstrap only and must be changed immediately
 
 Recommended:

@@ -84,6 +84,7 @@ Language: [English](./README.md) | **简体中文**
 - 自定义部署目录、时区、API/User/Admin 端口
 - 自定义 Redis 端口与密码
 - PostgreSQL 模式下自定义数据库端口、库名、用户名、密码
+- Docker 启动前预检查 Redis / PostgreSQL 宿主机端口占用，并明确选择停用旧宿主机服务、重新输入端口或取消
 - 设置默认管理员用户名与密码
 - 收集域名配置：
   - User 域名
@@ -129,7 +130,7 @@ Language: [English](./README.md) | **简体中文**
   - Admin 前端静态文件
 - 选择 `PostgreSQL + Redis` 时自动安装本机 PostgreSQL
 - 写入配置前自动做 PostgreSQL 可用性预检查
-- 自动创建或复用 PostgreSQL 数据库与用户
+- 自动创建或复用 PostgreSQL 数据库与用户，新建本机数据库时强制使用 UTF-8 编码
 - 自动生成 API 配置文件
 - 自动生成 JWT / User JWT / Redis 队列配置
 - 自动设置默认管理员账户
@@ -148,7 +149,9 @@ Language: [English](./README.md) | **简体中文**
 - 自定义镜像版本 TAG
 - 自定义部署目录与三端端口
 - 录入外部 PostgreSQL 连接信息
+- 从所选 Docker 网络验证 PostgreSQL 连通性与账号密码是否正确
 - 录入外部 Redis 连接信息
+- 从所选 Docker 网络验证 Redis 连通性与密码是否正确
 - 设置默认管理员账户
 - 自动生成：
   - `config.yml`
@@ -234,6 +237,7 @@ Language: [English](./README.md) | **简体中文**
   - 删除安装目录
   - 删除状态文件
   - 清理 Nginx 配置
+  - 若 Redis / PostgreSQL 由脚本在二进制部署时安装，则同时停用宿主机 Redis / PostgreSQL，避免切回 Docker 模式时端口冲突
 
 ### 5. 检查版本
 
@@ -295,6 +299,8 @@ Language: [English](./README.md) | **简体中文**
   - 内核安全参数
 - 如果选择“仅密钥登录”，`root` 的 SSH 密码登录会被禁用；此时即使密码正确，也会表现为认证失败
 - 二进制部署会写入 systemd 服务文件
+- 二进制部署可能安装并启用本机 Redis / PostgreSQL；卸载时仅在确认它们由脚本安装的情况下停用
+- Dujiao-Next 要求 PostgreSQL 数据库使用 UTF-8 编码；已有非 UTF-8 数据库需要先备份并重建后再使用
 - 默认管理员账号密码仅适合初始化使用，部署完成后必须立即修改
 
 建议：
