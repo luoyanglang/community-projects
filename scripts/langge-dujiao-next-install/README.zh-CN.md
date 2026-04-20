@@ -5,6 +5,15 @@ Language: [English](./README.md) | **简体中文**
 > 维护者：LangGe  
 > Telegram：[@luoyanglang](https://t.me/luoyanglang)
 
+## 视频教程
+
+如果你更习惯跟着视频一步一步操作，可以直接参考下面的教程：
+
+- Docker 部署完整实战：[Dujiao-Next 一键部署教程：Docker 部署完整实战｜域名、HTTPS、初始化一次搞定](https://youtu.be/VtsY82mak4Q)
+- 二进制部署完整实战：[Dujiao-Next 一键部署教程：二进制部署完整实战｜PostgreSQL、Redis、Nginx 全流程](https://youtu.be/-C63BCOe4Qs)
+- 外部面板环境部署：[Dujiao-Next 一键部署教程：外部面板环境部署｜1Panel / 宝塔复用 Redis、PostgreSQL、Nginx](https://youtu.be/6XPZdTmtISA)
+- 系统安全加固实战：[Dujiao-Next 一键部署教程：系统安全加固实战｜SSH、UFW、Fail2ban、防锁死配置](https://www.youtube.com/watch?v=vdMRXAIUzfw)
+
 ## 项目简介
 
 `langge-dujiao-next-install` 是一个社区维护的 Dujiao-Next 一键部署与运维脚本。

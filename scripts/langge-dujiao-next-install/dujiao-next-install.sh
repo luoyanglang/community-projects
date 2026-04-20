@@ -312,10 +312,16 @@ find_sshd_bin() {
   command -v sshd 2>/dev/null || true
 }
 
+ensure_sshd_runtime_dir() {
+  mkdir -p /run/sshd 2>/dev/null || return 1
+  chmod 755 /run/sshd 2>/dev/null || true
+}
+
 test_sshd_config() {
   local sshd_bin
   sshd_bin="$(find_sshd_bin)"
   [[ -n "${sshd_bin}" ]] || return 1
+  ensure_sshd_runtime_dir || return 1
   "${sshd_bin}" -t -f "${1}"
 }
 
